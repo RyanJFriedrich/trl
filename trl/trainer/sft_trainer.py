@@ -441,7 +441,9 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
         assistant_masks = (
             [example["assistant_masks"] for example in examples] if "assistant_masks" in examples[0] else None
         )
-
+        loss_weights = (
+            [example["loss_weights"] for example in examples] if "loss_weights" in examples[0] else None
+        )
         # Truncate per sequence if necessary
         if self.max_length is not None and not self.padding_free:
             if self.truncation_mode == "keep_start":
@@ -458,6 +460,8 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
                 completion_mask = [m[sl] for m in completion_mask]
             if assistant_masks is not None:
                 assistant_masks = [m[sl] for m in assistant_masks]
+            if loss_weights is not None:
+                loss_weights = [w[sl] for w in loss_weights]    
 
         # Convert to tensor
         input_ids = [torch.tensor(ids) for ids in input_ids]
@@ -466,7 +470,8 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
             completion_mask = [torch.tensor(m) for m in completion_mask]
         if assistant_masks is not None:
             assistant_masks = [torch.tensor(m) for m in assistant_masks]
-
+        if loss_weights is not None:
+            loss_weights = [torch.tensor(w) for w in loss_weights]
         # For padding-free, we should NOT create attention_mask as it causes FlashAttention to ignore position_ids and
         # compute wrong cu_seq_lens from the all-1s mask
         if self.padding_free:
@@ -517,6 +522,10 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
                 assistant_masks, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
             )
             output["labels"][assistant_masks == 0] = -100
+        if loss_weights is not None:
+            output["loss_weights"] = pad(
+                loss_weights, padding_value=0.0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
+            )    
         return output
 
     @staticmethod
@@ -1484,14 +1493,34 @@ class SFTTrainer(_BaseTrainer):
 
                     else:  # language modeling case
                         if is_conversational(example):
+                            messages = example["messages"]
                             processed = self._tokenize(
                                 processing_class,
-                                example["messages"],
+                                messages,
                                 tools=tools,
                                 return_assistant_tokens_mask=assistant_only_loss,
                                 **example.get("chat_template_kwargs", {}),
                             )
                             output = {k: processed[k] for k in ("input_ids", "assistant_masks") if k in processed}
+                        
+                            if any(msg.get("role") == "assistant" and "weight" in msg for msg in messages):
+                                loss_weights = [0.0] * len(output["input_ids"])
+                                cum_len = 0
+                                for i, msg in enumerate(messages):
+                                    prefix = self._tokenize(
+                                        processing_class,
+                                        messages[: i + 1],
+                                        tools=tools,
+                                        **example.get("chat_template_kwargs", {}),
+                                    )["input_ids"]
+                                    start, end = cum_len, len(prefix)
+                                    if msg.get("role") == "assistant" and "weight" in msg:
+                                        w = float(msg["weight"])
+                                        for j in range(start, min(end, len(loss_weights))):
+                                            loss_weights[j] = w
+                                    cum_len = end
+                                output["loss_weights"] = loss_weights
+                         
                         else:
                             output = {
                                 "input_ids": self._tokenize(processing_class, example[dataset_text_field])["input_ids"]
@@ -1528,6 +1557,8 @@ class SFTTrainer(_BaseTrainer):
                     columns.append("completion_mask")
                 if "assistant_masks" in get_dataset_column_names(dataset):
                     columns.append("assistant_masks")
+                if "loss_weights" in get_dataset_column_names(dataset):
+                    columns.append("loss_weights")    
 
                 dataset = dataset.select_columns(columns)
 
@@ -1558,11 +1589,26 @@ class SFTTrainer(_BaseTrainer):
             if self._is_vision_dataset:
                 self._signature_columns = ["messages", "prompt", "completion", "image", "images"]
             else:
-                self._signature_columns = ["input_ids", "labels", "seq_lengths", "completion_mask", "assistant_masks"]
+                self._signature_columns = ["input_ids", "labels", "seq_lengths", "completion_mask", "assistant_masks", "loss_weights"]
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         mode = "train" if self.model.training else "eval"
         prediction_loss_only = inputs.pop("_prediction_loss_only", None)
+        
+        # Pop before the model forward sees it
+        loss_weights = inputs.pop("loss_weights", None)
+
+        # --- WEIGHTED SFT FORK ---
+        if loss_weights is not None and self.args.loss_type == "nll" and not self.args.use_liger_kernel:
+            inputs["loss_weights"] = loss_weights
+            return self._compute_weighted_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+        elif loss_weights is not None:
+            logger.warning(
+                "loss_weights only supported with loss_type='nll' and no Liger kernel. Ignoring."
+            )
+        # --- END WEIGHTED SFT FORK ---
 
         # Set aside labels as it will be dropped by super().compute_loss() if a custom `compute_loss_func` is used.
         # This can be removed when this issue is fixed.
@@ -1708,6 +1754,60 @@ class SFTTrainer(_BaseTrainer):
             aux_loss = outputs.aux_loss
             aux_loss = self.accelerator.gather_for_metrics(aux_loss).mean().item()
             self._metrics[mode]["aux_loss"].append(aux_loss)
+
+        return (loss, outputs) if return_outputs else loss
+    
+    def _compute_weighted_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        """
+        Compute per-token weighted cross-entropy for SFT.
+        Activates only when `loss_weights` is present in the batch.
+        """
+        labels = inputs.pop("labels", None)
+        loss_weights = inputs.pop("loss_weights")
+
+        # Forward without labels so the model returns logits, not its internal loss
+        outputs = model(**{k: v for k, v in inputs.items() if k not in ("labels", "loss_weights")})
+        logits = outputs.logits
+
+        # Align for next-token prediction
+        if "shift_labels" in inputs:
+            raise NotImplementedError(
+                "loss_weights is not yet supported with context/sequence parallelism (shift_labels). "
+                "Use standard data loading or open an issue if you need this.")
+        else:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            shift_weights = loss_weights[..., 1:].contiguous()
+            
+        # Flatten
+        shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        shift_labels = shift_labels.view(-1)
+        shift_weights = shift_weights.view(-1)
+
+        # Per-token CE
+        per_token_loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100, reduction="none")
+        shift_weights = shift_weights.to(per_token_loss.dtype)
+        # Apply weights
+        weighted_loss = per_token_loss * shift_weights
+
+        # Normalize over non-zero-weight valid tokens
+        # NOTE: denominator counts both positive and negative weights. This is intentional
+        # per the spec (mean over all active tokens), but means dense negative batches will
+        # dilute effective signal magnitude.
+        mask = shift_labels != -100
+        nonzero = mask & (shift_weights != 0)
+
+        if nonzero.any():
+            if num_items_in_batch is not None:
+                # I'm assuming HF pattern: sum locally, divide by global valid-token count
+                if isinstance(num_items_in_batch, torch.Tensor):
+                    num_items_in_batch = num_items_in_batch.to(weighted_loss.device)
+                loss = weighted_loss[nonzero].sum() / num_items_in_batch
+            else:
+                loss = weighted_loss[nonzero].mean()
+        else:
+            # Keep graph alive for distributed backward when all tokens are masked
+            loss = (logits.float().sum() * 0.0)
 
         return (loss, outputs) if return_outputs else loss
 
