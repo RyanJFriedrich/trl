@@ -525,7 +525,8 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
         if loss_weights is not None:
             output["loss_weights"] = pad(
                 loss_weights, padding_value=0.0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
-            )    
+            )
+            output["labels"][output["loss_weights"] == 0] = -100    
         return output
 
     @staticmethod
@@ -1798,13 +1799,7 @@ class SFTTrainer(_BaseTrainer):
         nonzero = mask & (shift_weights != 0)
 
         if nonzero.any():
-            if num_items_in_batch is not None:
-                # I'm assuming HF pattern: sum locally, divide by global valid-token count
-                if isinstance(num_items_in_batch, torch.Tensor):
-                    num_items_in_batch = num_items_in_batch.to(weighted_loss.device)
-                loss = weighted_loss[nonzero].sum() / num_items_in_batch
-            else:
-                loss = weighted_loss[nonzero].mean()
+            loss = weighted_loss[nonzero].mean()
         else:
             # Keep graph alive for distributed backward when all tokens are masked
             loss = (logits.float().sum() * 0.0)
